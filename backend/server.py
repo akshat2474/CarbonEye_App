@@ -1,242 +1,182 @@
 import os
-import json
-import base64
-import random
-from datetime import datetime
+from datetime import datetime, timezone
+import httpx
+import numpy as np
+import rasterio
 from dateutil.relativedelta import relativedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 load_dotenv()
 
-PORT = int(os.environ.get('PORT', 3000))
-CLIENT_ID = os.environ.get('CLIENT_ID')
-CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
 
-# --- EVALSCRIPTS ---
 
-TRUE_COLOR_EVALSCRIPT = """
+NDVI_EVALSCRIPT = """
 //VERSION=3
-function setup() {
-  return {
-    input: ["B04", "B03", "B02"],
-    output: { bands: 3 }
-  };
-}
-function linearStretch(value, min, max) {
-    if (value < min) return 0;
-    if (value > max) return 1;
-    return (value - min) / (max - min);
-}
-function evaluatePixel(sample) {
-  const min = 0.0;
-  const max = 0.4;
-  let r = linearStretch(sample.B04, min, max);
-  let g = linearStretch(sample.B03, min, max);
-  let b = linearStretch(sample.B02, min, max);
-  return [r, g, b];
-}
-"""
 
-NDVI_DATA_EVALSCRIPT = """
-//VERSION=3
 function setup() {
     return {
         input: ["B04", "B08"],
-        output: { bands: 1, sampleType: "FLOAT32" }
+        output: {
+            bands: 1,
+            sampleType: "FLOAT32"
+        }
     };
 }
+
 function evaluatePixel(sample) {
-    let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04 + 1e-6);
-    return [ndvi];
+    return [
+        (sample.B08 - sample.B04) /
+        (sample.B08 + sample.B04 + 1e-6)
+    ];
 }
 """
 
-NDVI_VISUAL_EVALSCRIPT = """
-//VERSION=3
-function setup() {
-    return {
-        input: ["B04", "B08"], 
-        output: { bands: 3 }
-    };
-}
-const ramp = [
-    [-1.0, 0x000000],
-    [-0.2, 0xa52a2a],
-    [0.0, 0xffff00], 
-    [0.2, 0xadff2f], 
-    [0.4, 0x008000], 
-    [0.6, 0x006400], 
-    [0.8, 0x004000], 
-    [1.0, 0x002000]  
-];
-const visualizer = new ColorRampVisualizer(ramp);
 
-function evaluatePixel(sample) {
-    let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
-    return visualizer.process(ndvi);
-}
-"""
+class AnalysisRequest(BaseModel):
+    bbox: list[float]
 
-# --- HELPER FUNCTIONS ---
 
-def get_access_token():
-    url = "https://services.sentinel-hub.com/oauth/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials",
-    }
-    response = requests.post(url, data=data)
+async def get_token(client):
+    response = await client.post(
+        "https://services.sentinel-hub.com/oauth/token",
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        },
+    )
+
     response.raise_for_status()
     return response.json()["access_token"]
 
-def fetch_sentinel_image(bbox, from_date, to_date, evalscript, access_token, fmt='image/png'):
-    url = "https://services.sentinel-hub.com/api/v1/process"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/octet-stream" if 'tiff' in fmt else "image/png"
-    }
-    payload = {
-        "input": {
-            "bounds": {
-                "bbox": bbox,
-                "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}
+
+async def get_ndvi(client, bbox, start, end, token):
+    response = await client.post(
+        "https://services.sentinel-hub.com/api/v1/process",
+        headers={
+            "Authorization": f"Bearer {token}",
+        },
+        json={
+            "input": {
+                "bounds": {
+                    "bbox": bbox,
+                },
+                "data": [
+                    {
+                        "type": "sentinel-2-l2a",
+                        "dataFilter": {
+                            "timeRange": {
+                                "from": f"{start}T00:00:00Z",
+                                "to": f"{end}T23:59:59Z",
+                            },
+                            "mosaickingOrder": "leastCC",
+                            "maxCloudCoverage": 30,
+                        },
+                    }
+                ],
             },
-            "data": [{
-                "type": "sentinel-2-l2a",
-                "dataFilter": {
-                    "timeRange": {
-                        "from": f"{from_date}T00:00:00Z",
-                        "to": f"{to_date}T23:59:59Z"
-                    },
-                    "mosaickingOrder": "leastCC",
-                    "maxCloudCoverage": 30
-                }
-            }]
+            "output": {
+                "width": 512,
+                "height": 512,
+                "responses": [
+                    {
+                        "identifier": "default",
+                        "format": {
+                            "type": "image/tiff"
+                        },
+                    }
+                ],
+            },
+            "evalscript": NDVI_EVALSCRIPT,
         },
-        "output": {
-            "width": 512,
-            "height": 512,
-            "responses": [{
-                "identifier": "default",
-                "format": {"type": fmt}
-            }]
-        },
-        "evalscript": evalscript
-    }
-    
-    response = requests.post(url, json=payload, headers=headers)
+    )
+
     response.raise_for_status()
-    
-    if 'tiff' in fmt:
-        return response.content
-    else:
-        # Base64 encode the PNG for JSON response
-        encoded = base64.b64encode(response.content).decode('utf-8')
-        return f"data:{fmt};base64,{encoded}"
+    return response.content
 
-def analyze_ndvi_difference(bbox, recent_ndvi_data, past_ndvi_data):
+
+def read_ndvi(data):
+    with rasterio.MemoryFile(data) as file:
+        with file.open() as image:
+            return image.read(1)
+
+
+def find_deforestation(recent, past, bbox):
+    change = recent - past
+
+    rows, cols = np.where(change < -0.15)
+
+    height, width = change.shape
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+
     alerts = []
-    CRITICAL_THRESHOLD = -0.3
-    MODERATE_THRESHOLD = -0.15
-    
-    grid_size = 15
-    for i in range(grid_size):
-        for j in range(grid_size):
-            change = (random.random() - 0.65) * 0.5
-            
-            severity = None
-            if change < CRITICAL_THRESHOLD:
-                severity = 'critical'
-            elif change < MODERATE_THRESHOLD:
-                severity = 'moderate'
-                
-            if severity and random.random() > 0.85:
-                lon = bbox[0] + (i / grid_size) * (bbox[2] - bbox[0])
-                lat = bbox[1] + (j / grid_size) * (bbox[3] - bbox[1])
-                alerts.append({
-                    "position": {"lat": lat, "lon": lon},
-                    "severity": severity,
-                    "change": f"{change:.3f}"
-                })
-    return alerts
 
-# --- MAIN SERVER ---
+    for row, col in zip(rows, cols):
+        value = float(change[row, col])
 
-@app.route('/analyze-deforestation', methods=['POST'])
-def analyze_deforestation():
-    try:
-        data = request.json
-        bbox = data.get('bbox')
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            return jsonify({"error": "Invalid bbox"}), 400
-            
-        print(f"Analyzing deforestation for bbox: {bbox}")
-        token = get_access_token()
-        
-        now = datetime.now()
-        to_date_recent = now
-        from_date_recent = now - relativedelta(months=1)
-        
-        to_date_past = from_date_recent
-        from_date_past = to_date_past - relativedelta(months=1)
-        
-        fmt_date = lambda d: d.strftime('%Y-%m-%d')
-        
-        tasks = [
-            (bbox, fmt_date(from_date_recent), fmt_date(to_date_recent), TRUE_COLOR_EVALSCRIPT, token, 'image/png'),
-            (bbox, fmt_date(from_date_recent), fmt_date(to_date_recent), NDVI_VISUAL_EVALSCRIPT, token, 'image/png'),
-            (bbox, fmt_date(from_date_past), fmt_date(to_date_past), TRUE_COLOR_EVALSCRIPT, token, 'image/png'),
-            (bbox, fmt_date(from_date_past), fmt_date(to_date_past), NDVI_VISUAL_EVALSCRIPT, token, 'image/png'),
-            (bbox, fmt_date(from_date_recent), fmt_date(to_date_recent), NDVI_DATA_EVALSCRIPT, token, 'image/tiff'),
-            (bbox, fmt_date(from_date_past), fmt_date(to_date_past), NDVI_DATA_EVALSCRIPT, token, 'image/tiff')
-        ]
-        
-        results = [None] * 6
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_idx = {executor.submit(fetch_sentinel_image, *task): i for i, task in enumerate(tasks)}
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                results[idx] = future.result()
-                
-        today_true_color, today_ndvi, past_true_color, past_ndvi, recent_ndvi_data, past_ndvi_data = results
-        
-        alerts = analyze_ndvi_difference(bbox, recent_ndvi_data, past_ndvi_data)
-        
-        return jsonify({
-            "today": {
-                "trueColor": today_true_color,
-                "ndvi": today_ndvi,
-            },
-            "past": {
-                "trueColor": past_true_color,
-                "ndvi": past_ndvi,
-            },
-            "alerts": alerts,
-            "analysis": {
-                "totalAlerts": len(alerts),
-                "criticalAlerts": sum(1 for a in alerts if a['severity'] == 'critical'),
-                "moderateAlerts": sum(1 for a in alerts if a['severity'] == 'moderate'),
-                "timeRange": {
-                    "recent": f"{fmt_date(from_date_recent)} to {fmt_date(to_date_recent)}",
-                    "past": f"{fmt_date(from_date_past)} to {fmt_date(to_date_past)}"
-                }
-            }
+        alerts.append({
+            "lat": max_lat - (row / height) * (max_lat - min_lat),
+            "lon": min_lon + (col / width) * (max_lon - min_lon),
+            "change": round(value, 3),
         })
 
-    except Exception as e:
-        print(f"Server Error: {e}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    return alerts
 
-if __name__ == '__main__':
-    print(f"Server running at http://localhost:{PORT}")
-    print("Endpoint available: POST /analyze-deforestation")
-    app.run(host='0.0.0.0', port=PORT)
+
+@app.post("/analyze-deforestation")
+async def analyze(req: AnalysisRequest):
+
+    now = datetime.now(timezone.utc)
+
+    recent_end = now
+    recent_start = now - relativedelta(months=1)
+
+    past_end = recent_start
+    past_start = past_end - relativedelta(months=1)
+
+    recent_start = recent_start.strftime("%Y-%m-%d")
+    recent_end = recent_end.strftime("%Y-%m-%d")
+    past_start = past_start.strftime("%Y-%m-%d")
+    past_end = past_end.strftime("%Y-%m-%d")
+
+    async with httpx.AsyncClient() as client:
+
+        token = await get_token(client)
+
+        recent_data = await get_ndvi(
+            client,
+            req.bbox,
+            recent_start,
+            recent_end,
+            token,
+        )
+
+        past_data = await get_ndvi(
+            client,
+            req.bbox,
+            past_start,
+            past_end,
+            token,
+        )
+
+    recent_ndvi = read_ndvi(recent_data)
+    past_ndvi = read_ndvi(past_data)
+
+    alerts = find_deforestation(
+        recent_ndvi,
+        past_ndvi,
+        req.bbox,
+    )
+
+    return {
+        "alerts": alerts,
+        "recentPeriod": f"{recent_start} to {recent_end}",
+        "pastPeriod": f"{past_start} to {past_end}",
+    }

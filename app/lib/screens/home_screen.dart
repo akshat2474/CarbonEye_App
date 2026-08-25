@@ -1,5 +1,3 @@
-import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'package:carboneye/screens/all_alerts_screen.dart';
 import 'package:carboneye/api_service.dart';
@@ -28,6 +26,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   DateTime _lastSynced = DateTime.now();
   WatchlistItem? _activeWatchlistItem;
+  String? _recentPeriod;
+  String? _pastPeriod;
 
   bool _isSelectionMode = false;
   List<LatLng> _selectionPoints = [];
@@ -36,16 +36,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    // if (_watchlistRegions.isNotEmpty) {
-    //   _runAnalysis(_watchlistRegions.first);
-    // }
   }
-
-
-  String? _t0TrueColorImageBase64;
-  String? _t1TrueColorImageBase64;
-  String? _t0NDVIImageBase64;
-  String? _t1NDVIImageBase64;
 
   final List<WatchlistItem> _watchlistRegions = [
     WatchlistItem(
@@ -145,34 +136,28 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _isLoading = true;
       _detections.clear();
-      _t0TrueColorImageBase64 = null;
-      _t1TrueColorImageBase64 = null;
-      _t0NDVIImageBase64 = null;
-      _t1NDVIImageBase64 = null;
+      _recentPeriod = null;
+      _pastPeriod = null;
       _activeWatchlistItem = item;
     });
 
     try {
-      final result = await _apiService.getImagesForRegion(item.bbox);
+      final result = await _apiService.analyzeRegion(item.bbox);
       if (!mounted) return;
 
       setState(() {
-        _t0TrueColorImageBase64 = result['past']['trueColor'];
-        _t0NDVIImageBase64 = result['past']['ndvi'];
-        _t1TrueColorImageBase64 = result['today']['trueColor'];
-        _t1NDVIImageBase64 = result['today']['ndvi'];
-
         if (result['alerts'] != null) {
           final alerts = List<Map<String, dynamic>>.from(result['alerts']);
           _detections.addAll(alerts);
         }
-
+        _recentPeriod = result['recentPeriod'];
+        _pastPeriod = result['pastPeriod'];
         _lastSynced = DateTime.now();
       });
 
       _mapController.move(item.coordinates, 8.0);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text("Analysis complete for ${item.name}."),
+        content: Text("Analysis complete for ${item.name}. Found ${_detections.length} alerts."),
         backgroundColor: Colors.green.shade700,
       ));
     } catch (e) {
@@ -186,18 +171,36 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Derive severity from the NDVI change value returned by the backend.
+  String _getSeverityFromChange(double change) {
+    if (change < -0.3) return 'critical';
+    if (change < -0.15) return 'moderate';
+    return 'low';
+  }
+
+  Color _getSeverityColor(String severity) {
+    switch (severity.toLowerCase()) {
+      case 'critical':
+        return Colors.red.shade400;
+      case 'moderate':
+        return Colors.orange.shade400;
+      default:
+        return Colors.yellow.shade400;
+    }
+  }
+
   List<Marker> _buildDetectionMarkers() {
     return _detections.map((detection) {
-      final position = detection['position'];
-      final severity =
-          detection['severity']?.toString().toLowerCase() ?? 'moderate';
-      final color =
-          severity == 'critical' ? Colors.red.shade400 : Colors.orange.shade400;
+      final lat = (detection['lat'] as num).toDouble();
+      final lon = (detection['lon'] as num).toDouble();
+      final change = (detection['change'] as num).toDouble();
+      final severity = _getSeverityFromChange(change);
+      final color = _getSeverityColor(severity);
 
       return Marker(
         width: 18.0,
         height: 18.0,
-        point: LatLng(position['lat'], position['lon']),
+        point: LatLng(lat, lon),
         child: GestureDetector(
           onTap: () => _showDetectionDetailsDialog(detection),
           child: Container(
@@ -246,8 +249,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                       const SizedBox(height: 8),
                       if (_isSelectionMode) _buildSelectionControls(),
-                      if (_t0TrueColorImageBase64 != null)
-                        _buildImageComparison(),
+                      if (_recentPeriod != null) _buildAnalysisSummary(),
                       _buildLastSynced(),
                       const SizedBox(height: 30),
                       _buildWatchlist(),
@@ -290,80 +292,35 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildImageComparison() {
+  Widget _buildAnalysisSummary() {
+    final critical = _detections.where((d) => _getSeverityFromChange((d['change'] as num).toDouble()) == 'critical').length;
+    final moderate = _detections.where((d) => _getSeverityFromChange((d['change'] as num).toDouble()) == 'moderate').length;
+
     return Padding(
       padding: const EdgeInsets.only(top: 24.0),
       child: NeuCard(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text("Satellite Image Comparison",
+            Text("Analysis Results",
                 style: kSectionTitleStyle.copyWith(fontSize: 22)),
             const SizedBox(height: 4),
-            Text("Comparing imagery from the analysis period.",
+            Text("NDVI change detection between two periods.",
                 style: kSecondaryBodyTextStyle),
-            const SizedBox(height: 20),
-            _buildImageSet("Before (15 Days Ago)", _t0TrueColorImageBase64,
-                _t0NDVIImageBase64),
-            const SizedBox(height: 24),
-            _buildImageSet(
-                "After (Today)", _t1TrueColorImageBase64, _t1NDVIImageBase64),
+            const SizedBox(height: 16),
+            _buildDetailRow('Recent Period:', _recentPeriod ?? 'N/A'),
+            const SizedBox(height: 8),
+            _buildDetailRow('Past Period:', _pastPeriod ?? 'N/A'),
+            const SizedBox(height: 8),
+            _buildDetailRow('Total Alerts:', '${_detections.length}'),
+            const SizedBox(height: 8),
+            _buildDetailRow('Critical:', '$critical', color: Colors.red.shade400),
+            const SizedBox(height: 8),
+            _buildDetailRow('Moderate:', '$moderate', color: Colors.orange.shade400),
           ],
         ),
       ),
     ).animate().fadeIn(duration: 400.ms).slideY(begin: 0.1);
-  }
-
-  Widget _buildImageSet(String title, String? trueColorImg, String? ndviImg) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title,
-            style: kBodyTextStyle.copyWith(
-                fontSize: 18, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            if (trueColorImg != null)
-              _buildImageColumn("True Color", trueColorImg),
-            const SizedBox(width: 16),
-            if (ndviImg != null) _buildImageColumn("NDVI", ndviImg),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildImageColumn(String title, String base64String) {
-    return Expanded(
-      child: Column(
-        children: [
-          Text(title,
-              style: kBodyTextStyle.copyWith(fontWeight: FontWeight.w600)),
-          const SizedBox(height: 8),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(12.0),
-            child: Image.memory(
-              base64Decode(base64String.split(',').last),
-              fit: BoxFit.cover,
-              gaplessPlayback: true,
-              errorBuilder: (context, error, stackTrace) {
-                return AspectRatio(
-                  aspectRatio: 1,
-                  child: Container(
-                    color: kCardColor,
-                    child: const Center(
-                      child: Icon(Icons.error_outline,
-                          color: Colors.red, size: 40),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
   }
 
   SliverAppBar _buildSliverAppBar() {
@@ -495,11 +452,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _showDetectionDetailsDialog(Map<String, dynamic> detection) {
-    final severity = detection['severity']?.toString() ?? 'Medium';
-    final area = (detection['area_ha'] as num?)?.toStringAsFixed(2) ?? '0.00';
-    final center = detection['center_coordinates'];
-    final lat = (center['latitude'] as num?)?.toStringAsFixed(4) ?? 'N/A';
-    final lon = (center['longitude'] as num?)?.toStringAsFixed(4) ?? 'N/A';
+    final change = (detection['change'] as num).toDouble();
+    final lat = (detection['lat'] as num).toStringAsFixed(4);
+    final lon = (detection['lon'] as num).toStringAsFixed(4);
+    final severity = _getSeverityFromChange(change);
     final Color severityColor = _getSeverityColor(severity);
 
     showDialog(
@@ -516,7 +472,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _buildDetailRow('Severity:', severity.capitalize(),
                   color: severityColor),
               const SizedBox(height: 12),
-              _buildDetailRow('Area Affected:', '$area ha'),
+              _buildDetailRow('NDVI Change:', change.toStringAsFixed(3)),
               const SizedBox(height: 12),
               _buildDetailRow('Coordinates:', '$lat, $lon'),
             ],
@@ -543,17 +499,6 @@ class _HomeScreenState extends State<HomeScreen> {
               style: kBodyTextStyle.copyWith(
                   fontWeight: FontWeight.bold, color: color ?? kWhiteColor))),
     ]);
-  }
-
-  Color _getSeverityColor(String severity) {
-    switch (severity.toLowerCase()) {
-      case 'critical':
-        return Colors.red.shade400;
-      case 'high':
-        return Colors.orange.shade400;
-      default:
-        return Colors.yellow.shade400;
-    }
   }
 
   Widget _buildSelectionControls() {

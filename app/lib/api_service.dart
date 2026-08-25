@@ -2,28 +2,23 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  Future<Map<String, dynamic>> getImagesForRegion(List<double> bbox) async {
+  Future<Map<String, dynamic>> analyzeRegion(List<double> bbox) async {
     final uri = Uri.parse('${AppConfig.baseUrl}/analyze-deforestation');
-    try {
-      final response = await http.post(
-        uri,
-        headers: <String, String>{
-          'Content-Type': 'application/json; charset=UTF-8',
-        },
-        body: jsonEncode(<String, dynamic>{
-          'bbox': bbox,
-        }),
-      );
+    final response = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json; charset=UTF-8'},
+      body: jsonEncode({'bbox': bbox}),
+    );
 
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body);
-      } else {
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      String detail = 'Unknown error';
+      try {
         final errorBody = jsonDecode(response.body);
-        throw Exception(
-            'Failed to get images: ${errorBody['detail'] ?? 'Unknown error'}');
-      }
-    } catch (e) {
-      throw Exception('Failed to connect to the image service.');
+        detail = errorBody['detail'] ?? detail;
+      } catch (_) {}
+      throw Exception('Analysis failed (${response.statusCode}): $detail');
     }
   }
 }
