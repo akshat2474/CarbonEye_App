@@ -2,11 +2,11 @@
 
 **Eyes on the forest. Always.**
 
-CarbonEye is a powerful tool designed to provide real-time intelligence on deforestation activities across the globe. By leveraging satellite imagery analysis, it empowers users to monitor specific regions, receive timely alerts, and generate detailed impact reports for environmental, social, and governance (ESG) purposes.
+CarbonEye is a powerful tool designed to provide real-time intelligence on deforestation activities across the globe
 
 The platform consists of three main parts:
 
-* **A powerful backend** built with Python and Flask, responsible for the heavy lifting of fetching and analyzing satellite data.
+* **A powerful backend** built with Python and FastAPI, responsible for the heavy lifting of fetching and analyzing satellite data.
 * **A cross-platform frontend application** built with Flutter, providing a rich, interactive user experience for analysis on mobile (iOS/Android) and the web.
 
 ## Full-Stack Architecture
@@ -60,7 +60,6 @@ flowchart TB
 * **Real-time Analysis:** On-demand deforestation analysis of user-selected regions.
 * **Interactive Map Interface:** Users can pan, zoom, and select a bounding box to define an area for analysis.
 * **Data Visualization:** Displays true-color and NDVI satellite imagery for "before" and "after" comparison.
-* **Alerts & Watchlist:** Visualizes critical deforestation alerts on the map and allows users to save locations to a watchlist.
 
 ## Backend API Endpoints
 
